@@ -50,7 +50,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
