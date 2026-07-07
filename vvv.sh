@@ -1,98 +1,45 @@
+cat << 'EOF' > /tmp/install_vless.sh
 #!/bin/bash
-
-# ==========================================
-# 脚本名称: VLESS 动态出站中转一键部署脚本
-# 系统支持: Debian / Ubuntu / CentOS (amd64/arm64)
-# 安全性: Systemd 独立进程守护，支持后台开机自启
-# ==========================================
-
 export LANG=en_US.UTF-8
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-PLAIN='\033[0m'
+G="\e[32m" && R="\e[31m" && Y="\e[33m" && P="\e[0m"
 
-# 确保以 root 权限运行
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}错误：请使用 root 权限运行此脚本。${PLAIN}"
+echo -e "${Y}====================================================${P}"
+echo -e "       开始执行 VLESS 动态中转一键部署 (IBM Cloud)   "
+echo -e "${Y}====================================================${P}"
+
+# 1. 基础依赖安装
+echo -e "${Y}[1/5] 正在更新系统源并安装基础构建依赖...${P}"
+apt-get update -y && apt-get install -y wget curl tar git build-essential uuid-runtime
+
+# 2. Go 编译器部署
+echo -e "${Y}[2/5] 正在下载并配置 Go 1.22.5 编译环境...${P}"
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then GO_ARCH="amd64"; else GO_ARCH="arm64"; fi
+
+wget -O /tmp/go.tar.gz https://go.dev/dl/go1.22.5.linux-${GO_ARCH}.tar.gz
+if [ $? -ne 0 ]; then
+    echo -e "${R}错误: 下载 Go 语言包失败，请检查 VPS 出站网络状况。${P}"
     exit 1
 fi
 
-# 架构检测
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64)
-        GO_ARCH="amd64"
-        CF_ARCH="amd64"
-        ;;
-    aarch64)
-        GO_ARCH="arm64"
-        CF_ARCH="arm64"
-        ;;
-    *)
-        echo -e "${RED}暂不支持此系统架构: ${ARCH}${PLAIN}"
-        exit 1
-        ;;
-esac
+rm -rf /usr/local/go
+tar -C /usr/local -xzf /tmp/go.tar.gz
+rm -f /tmp/go.tar.gz
 
-# 基础系统环境检测与安装
-install_base_deps() {
-    echo -e "${YELLOW}正在检测并安装基础依赖...${PLAIN}"
-    if [ -f /etc/debian_version ]; then
-        apt-get update -y
-        apt-get install -y curl wget tar git build-essential uuid-runtime sudo
-    elif [ -f /etc/redhat-release ]; then
-        yum install -y curl wget tar git gcc make util-linux sudo
-    else
-        echo -e "${RED}未检测到受支持的包管理器 (APT/YUM)。${PLAIN}"
-        exit 1
-    fi
-}
+export PATH=$PATH:/usr/local/go/bin
+if ! grep -q "/usr/local/go/bin" /etc/profile; then
+    echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
+fi
 
-# Go 语言环境配置
-install_go() {
-    if command -v go >/dev/null 2>&1; then
-        echo -e "${GREEN}检测到 Go 语言环境已存在，跳过安装。${PLAIN}"
-        return
-    fi
+echo -e "      Go 编译器就位: $(go version)"
 
-    echo -e "${YELLOW}正在自动获取并安装最新的 Go 编译器...${PLAIN}"
-    # 尝试获取最新版本，若失败则回退至 1.22.5
-    GO_VER=$(curl -s https://go.dev/VERSION?m=text | head -n 1)
-    if [ -z "$GO_VER" ]; then
-        GO_VER="go1.22.5"
-    fi
+# 3. 写入源码并执行静态编译
+echo -e "${Y}[3/5] 正在写入核心 Go 源码并启动编译...${P}"
+BUILD_DIR="/tmp/vless-relay-build"
+rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR" && cd "$BUILD_DIR"
 
-    wget -O /tmp/go.tar.gz "https://go.dev/dl/${GO_VER}.linux-${GO_ARCH}.tar.gz"
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}Go 下载失败，请检查网络连接。${PLAIN}"
-        exit 1
-    fi
-
-    rm -rf /usr/local/go
-    tar -C /usr/local -xzf /tmp/go.tar.gz
-    rm -f /tmp/go.tar.gz
-
-    # 写入环境变量
-    if ! grep -q "/usr/local/go/bin" /etc/profile; then
-        echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-    fi
-    export PATH=$PATH:/usr/local/go/bin
-    echo -e "${GREEN}Go 编译环境部署完毕: $(go version)${PLAIN}"
-}
-
-# 动态写入并编译 Go 源码
-build_vless_relay() {
-    BUILD_DIR="/tmp/vless-relay-build"
-    rm -rf "$BUILD_DIR"
-    mkdir -p "$BUILD_DIR"
-    cd "$BUILD_DIR" || exit
-
-    echo -e "${YELLOW}正在生成 Go 语言核心中转源码...${PLAIN}"
-
-    cat << 'EOF' > main.go
+cat << 'GOEOF' > main.go
 package main
 
 import (
@@ -126,9 +73,9 @@ var upgrader = websocket.Upgrader{
 
 type VlessHeader struct {
 	Version  byte
-	Command  byte // 1: TCP, 2: UDP
+	Command  byte
 	Port     uint16
-	AddrType byte // 1: IPv4, 2: Domain, 3: IPv6
+	AddrType byte
 	Address  string
 	Payload  []byte
 }
@@ -146,21 +93,21 @@ func main() {
 
 		wsConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Printf("WebSocket upgrade error: %v", err)
+			log.Printf("WS upgrade error: %v", err)
 			return
 		}
 		defer wsConn.Close()
 
 		dialer, err := selectOutboundDialer(r.URL)
 		if err != nil {
-			log.Printf("Select outbound dialer error: %v", err)
+			log.Printf("Outbound dialer error: %v", err)
 			return
 		}
 
 		handleVlessSession(wsConn, uuidBytes, dialer)
 	})
 
-	log.Printf("VLESS 中转服务正在启动，监听端口: :%s，设定 UUID: %s", *portFlag, *uuidFlag)
+	log.Printf("VLESS 动态中转启动。监听端口: :%s, 目标 UUID: %s", *portFlag, *uuidFlag)
 	if err := http.ListenAndServe(":"+*portFlag, nil); err != nil {
 		log.Fatal(err)
 	}
@@ -210,19 +157,19 @@ func handleVlessSession(ws *websocket.Conn, uuidBytes []byte, dialer proxy.Diale
 
 	header, err := parseVlessHeader(firstMsg, uuidBytes)
 	if err != nil {
-		log.Printf("VLESS header parse error: %v", err)
+		log.Printf("Header error: %v", err)
 		return
 	}
 
 	if header.Command != 1 {
-		log.Println("Unsupported command: only TCP relay is implemented in this build")
+		log.Println("Unsupported CMD: Only TCP relay is implemented.")
 		return
 	}
 
 	targetAddr := net.JoinHostPort(header.Address, strconv.Itoa(int(header.Port)))
 	remoteConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
-		log.Printf("Dial target %s failed: %v", targetAddr, err)
+		log.Printf("Dial to %s failed: %v", targetAddr, err)
 		return
 	}
 	defer remoteConn.Close()
@@ -244,7 +191,6 @@ func handleVlessSession(ws *websocket.Conn, uuidBytes []byte, dialer proxy.Diale
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Remote -> WebSocket
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
@@ -263,7 +209,6 @@ func handleVlessSession(ws *websocket.Conn, uuidBytes []byte, dialer proxy.Diale
 		}
 	}()
 
-	// WebSocket -> Remote
 	go func() {
 		for {
 			select {
@@ -294,7 +239,7 @@ func parseVlessHeader(data []byte, uuidBytes []byte) (*VlessHeader, error) {
 	version := data[0]
 	for i := 0; i < 16; i++ {
 		if data[1+i] != uuidBytes[i] {
-			return nil, errors.New("UUID verification failed")
+			return nil, errors.New("UUID verify failed")
 		}
 	}
 	optLen := int(data[17])
@@ -313,7 +258,7 @@ func parseVlessHeader(data []byte, uuidBytes []byte) (*VlessHeader, error) {
 	switch addrType {
 	case 1:
 		if pos+4 > len(data) {
-			return nil, errors.New("invalid IPv4 address length")
+			return nil, errors.New("invalid IPv4 length")
 		}
 		address = net.IP(data[pos : pos+4]).String()
 		pos += 4
@@ -330,7 +275,7 @@ func parseVlessHeader(data []byte, uuidBytes []byte) (*VlessHeader, error) {
 		pos += domainLen
 	case 3:
 		if pos+16 > len(data) {
-			return nil, errors.New("invalid IPv6 address length")
+			return nil, errors.New("invalid IPv6 length")
 		}
 		address = net.IP(data[pos : pos+16]).String()
 		pos += 16
@@ -379,7 +324,7 @@ func (d *HTTPConnectDialer) Dial(network, address string) (net.Conn, error) {
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		conn.Close()
-		return nil, fmt.Errorf("HTTP CONNECT tunnel failed with status: %s", resp.Status)
+		return nil, fmt.Errorf("HTTP CONNECT tunnel failed: %s", resp.Status)
 	}
 
 	if br.Buffered() > 0 {
@@ -420,48 +365,31 @@ func normalizeDashPort(val string) string {
 	}
 	return val
 }
-EOF
+GOEOF
 
-    echo -e "${YELLOW}正在编译并打包程序...${PLAIN}"
-    export PATH=$PATH:/usr/local/go/bin
-    go mod init vless-relay 2>/dev/null
-    go get github.com/gorilla/websocket
-    go get golang.org/x/net/proxy
-    go mod tidy
-    go build -ldflags="-s -w" -o vless-relay main.go
+# 自动拉取依赖模块并执行生产级编译
+go mod init vless-relay 2>/dev/null
+go get github.com/gorilla/websocket@v1.5.3
+go get golang.org/x/net@v0.27.0
+go mod tidy
+go build -ldflags="-s -w" -o vless-relay main.go
 
-    if [ ! -f "vless-relay" ]; then
-        echo -e "${RED}编译失败，请检查编译日志。${PLAIN}"
-        exit 1
-    fi
+if [ ! -f "vless-relay" ]; then
+    echo -e "${R}错误: 编译程序失败，无法生成二进制。${P}"
+    exit 1
+fi
 
-    mv vless-relay /usr/local/bin/vless-relay
-    chmod +x /usr/local/bin/vless-relay
-    cd / && rm -rf "$BUILD_DIR"
-    echo -e "${GREEN}中转服务端编译并安装成功。${PLAIN}"
-}
+mv vless-relay /usr/local/bin/vless-relay
+chmod +x /usr/local/bin/vless-relay
+cd / && rm -rf "$BUILD_DIR"
+echo -e "${G}编译成功，二进制已移至 /usr/local/bin/vless-relay${P}"
 
-# 部署并配置 Systemd 守护进程
-configure_systemd() {
-    echo -e "${YELLOW}配置守护进程自启...${PLAIN}"
+# 4. 配置 Systemd 开机自启
+echo -e "${Y}[4/5] 正在注册并启动守护进程...${P}"
+LIST_PORT="8080"
+INPUT_UUID="1f9d104e-ca0e-4202-ba4b-a0afb969c747"
 
-    # 生成默认配置
-    read -p "请输入您希望中转监听的端口 (默认 8080): " LIST_PORT
-    [ -z "$LIST_PORT" ] && LIST_PORT="8080"
-
-    read -p "请输入您的 VLESS UUID (留空将自动生成一个 UUID): " INPUT_UUID
-    if [ -z "$INPUT_UUID" ]; then
-        if command -v uuidgen >/dev/null 2>&1; then
-            INPUT_UUID=$(uuidgen)
-        elif [ -f /proc/sys/kernel/random/uuid ]; then
-            INPUT_UUID=$(cat /proc/sys/kernel/random/uuid)
-        else
-            INPUT_UUID="1f9d104e-ca0e-4202-ba4b-a0afb969c747"
-        fi
-    fi
-
-    # 写入 systemd 服务
-    cat << EOF > /etc/systemd/system/vless-relay.service
+cat << SYSEOF > /etc/systemd/system/vless-relay.service
 [Unit]
 Description=VLESS Relay Service
 After=network.target
@@ -477,99 +405,51 @@ LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
+SYSEOF
+
+systemctl daemon-reload
+systemctl enable vless-relay.service
+systemctl restart vless-relay.service
+
+# 5. 延迟 2 秒并执行自动化自检
+sleep 2
+echo -e "${Y}[5/5] 开始对新部署的服务进行自动化健康审计...${P}"
+echo -e "${Y}====================================================${P}"
+
+STATUS=$(systemctl is-active vless-relay.service 2>/dev/null)
+if [ "$STATUS" = "active" ]; then
+    echo -e "[ ${G}OK${P} ] 进程守护状态: 活跃 (Active)"
+else
+    echo -e "[ ${R}FAIL${P} ] 进程守护状态: 异常 ($STATUS)"
+fi
+
+if ss -tlnp 2>/dev/null | grep -q ":$LIST_PORT "; then
+    echo -e "[ ${G}OK${P} ] 端口监听验证: 端口 $LIST_PORT 正在监听"
+else
+    echo -e "[ ${R}FAIL${P} ] 未检测到端口 $LIST_PORT 监听"
+fi
+
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$LIST_PORT/)
+HTML_BODY=$(curl -s http://127.0.0.1:$LIST_PORT/)
+if [ "$HTTP_CODE" = "200" ] && [[ "$HTML_BODY" == *"VLESS Relay"* ]]; then
+    echo -e "[ ${G}OK${P} ] HTTP 协议存活验证成功"
+else
+    echo -e "[ ${R}FAIL${P} ] HTTP 验证状态异常"
+fi
+
+WS_CODE=$(curl -i -s -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Host: 127.0.0.1" http://127.0.0.1:$LIST_PORT/ | head -n 1 | awk "{print \$2}")
+if [ "$WS_CODE" = "101" ]; then
+    echo -e "[ ${G}OK${P} ] WebSocket 升级协议握手验证成功 (HTTP 101)"
+else
+    echo -e "[ ${R}FAIL${P} ] WebSocket 协议测试异常 (响应码: $WS_CODE)"
+fi
+
+echo -e "${Y}====================================================${P}"
+echo -e "部署及审计完毕！您的 VLESS 中转服务现已后台常驻。"
+echo -e "监听端口: ${G}${LIST_PORT}${P} | 设定 UUID: ${G}${INPUT_UUID}${P}"
+echo -e "提示: IBM Cloud 用户请在 VPC 安全组中放行 ${Y}${LIST_PORT}${P} 端口的出入站规则 [15]。"
+echo -e "${Y}====================================================${P}"
+
+rm -f /tmp/install_vless.sh
 EOF
-
-    systemctl daemon-reload
-    systemctl enable vless-relay.service
-    systemctl restart vless-relay.service
-
-    echo -e "${GREEN}守护进程配置成功，并已拉起服务运行。${PLAIN}"
-    echo -e "${YELLOW}当前配置信息：${PLAIN}"
-    echo -e "  监听端口: ${GREEN}${LIST_PORT}${PLAIN}"
-    echo -e "  VLESS UUID: ${GREEN}${INPUT_UUID}${PLAIN}"
-}
-
-# 自动安装 Cloudflare Tunnel 客户端
-install_cloudflared() {
-    echo -e "${YELLOW}是否安装 Cloudflare Tunnel 客户端 (用于联动 Argo 进行内网穿透与优化防封)? (y/n)${PLAIN}"
-    read -p "请输入选择 (默认 n): " CHOICE
-    if [[ "$CHOICE" == "y" || "$CHOICE" == "Y" ]]; then
-        echo -e "${YELLOW}正在安装 cloudflared...${PLAIN}"
-        wget -q -O /tmp/cloudflared.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}.deb"
-        if [ -f /tmp/cloudflared.deb ]; then
-            dpkg -i /tmp/cloudflared.deb 2>/dev/null || apt-get install -f -y
-            rm -f /tmp/cloudflared.deb
-        else
-            # CentOS / RHEL 回退到下载二进制
-            wget -q -O /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
-            chmod +x /usr/local/bin/cloudflared
-        fi
-        echo -e "${GREEN}cloudflared 客户端安装成功。${PLAIN}"
-        echo -e "${YELLOW}您可以随时运行以下命令来绑定并启动 Argo 隧道：${PLAIN}"
-        echo -e "  1. 执行 ${GREEN}sudo cloudflared tunnel login${PLAIN} 绑定您的账户。"
-        echo -e "  2. 执行 ${GREEN}sudo cloudflared tunnel create <您的隧道名字>${PLAIN} 创建隧道。"
-    fi
-}
-
-# 卸载功能
-uninstall_service() {
-    echo -e "${RED}警告：您正在执行卸载操作，该操作将完全清除程序和守护进程。${PLAIN}"
-    read -p "确定要卸载吗? (y/n, 默认 n): " UN_CHOICE
-    if [[ "$UN_CHOICE" == "y" || "$UN_CHOICE" == "Y" ]]; then
-        systemctl stop vless-relay.service 2>/dev/null
-        systemctl disable vless-relay.service 2>/dev/null
-        rm -f /etc/systemd/system/vless-relay.service
-        systemctl daemon-reload
-        rm -f /usr/local/bin/vless-relay
-        echo -e "${GREEN}卸载完成。${PLAIN}"
-    else
-        echo -e "${YELLOW}已取消卸载。${PLAIN}"
-    fi
-}
-
-# 主菜单
-show_menu() {
-    clear
-    echo -e "==========================================="
-    echo -e "      VLESS 动态出站中转一键部署脚本         "
-    echo -e "==========================================="
-    echo -e "  1. 完整编译安装 (Go构建 + 进程守护)"
-    echo -e "  2. 重启 VLESS 中转服务"
-    echo -e "  3. 停止 VLESS 中转服务"
-    echo -e "  4. 查看中转服务运行日志"
-    echo -e "  5. 卸载中转服务"
-    echo -e "  0. 退出脚本"
-    echo -e "==========================================="
-    read -p "请输入选项: " MENU_ID
-    case "$MENU_ID" in
-        1)
-            install_base_deps
-            install_go
-            build_vless_relay
-            configure_systemd
-            install_cloudflared
-            ;;
-        2)
-            systemctl restart vless-relay.service
-            echo -e "${GREEN}服务已重启。${PLAIN}"
-            ;;
-        3)
-            systemctl stop vless-relay.service
-            echo -e "${YELLOW}服务已停止。${PLAIN}"
-            ;;
-        4)
-            journalctl -u vless-relay.service -n 50 -f
-            ;;
-        5)
-            uninstall_service
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}请输入正确的选项!${PLAIN}"
-            ;;
-    esac
-}
-
-show_menu
+bash /tmp/install_vless.sh
