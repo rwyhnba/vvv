@@ -1,338 +1,477 @@
 #!/bin/bash
-set -e
 
-echo "=== VLESS WS Transit 完整一键部署（路径传参 + 动态出站） ==="
+# ==========================================
+# 脚本名称: VLESS 动态出站中转一键部署脚本
+# 系统支持: Debian / Ubuntu / CentOS (amd64/arm64)
+# 安全性: Systemd 独立进程守护，支持后台开机自启
+# ==========================================
 
-INSTALL_DIR="/opt/vless-transit"
-mkdir -p $INSTALL_DIR
-cd $INSTALL_DIR
+export LANG=en_US.UTF-8
 
-# 安装依赖
-apt update -y
-apt install -y git golang curl openssl
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+PLAIN='\033[0m'
 
-# go.mod
-cat > go.mod << 'EOF'
-module vless-transit
+# 确保以 root 权限运行
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}错误：请使用 root 权限运行此脚本。${PLAIN}"
+    exit 1
+fi
 
-go 1.22
+# 架构检测
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)
+        GO_ARCH="amd64"
+        CF_ARCH="amd64"
+        ;;
+    aarch64)
+        GO_ARCH="arm64"
+        CF_ARCH="arm64"
+        ;;
+    *)
+        echo -e "${RED}暂不支持此系统架构: ${ARCH}${PLAIN}"
+        exit 1
+        ;;
+esac
 
-require github.com/gorilla/websocket v1.5.3
-EOF
-
-# ==================== parser/path.go ====================
-mkdir -p parser
-cat > parser/path.go << 'EOF'
-package parser
-
-import (
-	"fmt"
-	"net/url"
-	"strings"
-)
-
-type Upstream struct {
-	Type     string
-	Host     string
-	Port     int
-	Username string
-	Password string
+# 基础系统环境检测与安装
+install_base_deps() {
+    echo -e "${YELLOW}正在检测并安装基础依赖...${PLAIN}"
+    if [ -f /etc/debian_version ]; then
+        apt-get update -y
+        apt-get install -y curl wget tar git build-essential uuid-runtime sudo
+    elif [ -f /etc/redhat-release ]; then
+        yum install -y curl wget tar git gcc make util-linux sudo
+    else
+        echo -e "${RED}未检测到受支持的包管理器 (APT/YUM)。${PLAIN}"
+        exit 1
+    fi
 }
 
-func ParsePath(rawPath, rawQuery string) []Upstream {
-	var ups []Upstream
+# Go 语言环境配置
+install_go() {
+    if command -v go >/dev/null 2>&1; then
+        echo -e "${GREEN}检测到 Go 语言环境已存在，跳过安装。${PLAIN}"
+        return
+    fi
 
-	if rawQuery != "" {
-		values, _ := url.ParseQuery(rawQuery)
-		for _, key := range []string{"socks5", "s5", "https", "http", "proxyip", "up", "u", "p"} {
-			if v := values.Get(key); v != "" {
-				typ := map[string]string{
-					"socks5": "socks5", "s5": "socks5",
-					"https": "https", "http": "http",
-				}[key]
-				if typ == "" {
-					typ = "proxy"
-				}
-				if u := parseUpstream(v, typ); u != nil {
-					ups = append(ups, *u)
-				}
-			}
-		}
-	}
+    echo -e "${YELLOW}正在自动获取并安装最新的 Go 编译器...${PLAIN}"
+    # 尝试获取最新版本，若失败则回退至 1.22.5
+    GO_VER=$(curl -s https://go.dev/VERSION?m=text | head -n 1)
+    if [ -z "$GO_VER" ]; then
+        GO_VER="go1.22.5"
+    fi
 
-	clean := strings.TrimPrefix(rawPath, "/")
-	if clean != "" && len(ups) == 0 {
-		switch {
-		case strings.HasPrefix(clean, "socks5/") || strings.HasPrefix(clean, "s5/"):
-			ups = append(ups, *parseUpstream(strings.TrimPrefix(clean, "socks5/"), "socks5"))
-		case strings.HasPrefix(clean, "https/"):
-			ups = append(ups, *parseUpstream(strings.TrimPrefix(clean, "https/"), "https"))
-		case strings.HasPrefix(clean, "http/"):
-			ups = append(ups, *parseUpstream(strings.TrimPrefix(clean, "http/"), "http"))
-		default:
-			ups = append(ups, *parseUpstream(clean, "proxy"))
-		}
-	}
+    wget -O /tmp/go.tar.gz "https://go.dev/dl/${GO_VER}.linux-${GO_ARCH}.tar.gz"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Go 下载失败，请检查网络连接。${PLAIN}"
+        exit 1
+    fi
 
-	if len(ups) == 0 {
-		ups = append(ups, Upstream{Type: "direct"})
-	}
-	return ups
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf /tmp/go.tar.gz
+    rm -f /tmp/go.tar.gz
+
+    # 写入环境变量
+    if ! grep -q "/usr/local/go/bin" /etc/profile; then
+        echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
+    fi
+    export PATH=$PATH:/usr/local/go/bin
+    echo -e "${GREEN}Go 编译环境部署完毕: $(go version)${PLAIN}"
 }
 
-func parseUpstream(raw, typ string) *Upstream {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
-	u := &Upstream{Type: typ}
+# 动态写入并编译 Go 源码
+build_vless_relay() {
+    BUILD_DIR="/tmp/vless-relay-build"
+    rm -rf "$BUILD_DIR"
+    mkdir -p "$BUILD_DIR"
+    cd "$BUILD_DIR" || exit
 
-	if at := strings.LastIndex(raw, "@"); at != -1 {
-		auth := raw[:at]
-		if parts := strings.SplitN(auth, ":", 2); len(parts) == 2 {
-			u.Username = parts[0]
-			u.Password = parts[1]
-		}
-		raw = raw[at+1:]
-	}
+    echo -e "${YELLOW}正在生成 Go 语言核心中转源码...${PLAIN}"
 
-	if strings.HasPrefix(raw, "[") {
-		if end := strings.LastIndex(raw, "]:"); end != -1 {
-			u.Host = raw[1:end]
-			fmt.Sscanf(raw[end+2:], "%d", &u.Port)
-		}
-	} else if idx := strings.LastIndex(raw, ":"); idx != -1 {
-		u.Host = raw[:idx]
-		fmt.Sscanf(raw[idx+1:], "%d", &u.Port)
-	} else {
-		u.Host = raw
-	}
-	if u.Port == 0 {
-		u.Port = 443
-	}
-	return u
-}
-EOF
-
-# ==================== outbound ====================
-mkdir -p outbound
-
-cat > outbound/interface.go << 'EOF'
-package outbound
-
-import "net"
-
-type Outbound interface {
-	Connect(targetHost string, targetPort int) (net.Conn, error)
-}
-EOF
-
-cat > outbound/direct.go << 'EOF'
-package outbound
-
-import (
-	"fmt"
-	"net"
-)
-
-type Direct struct{}
-
-func (d *Direct) Connect(host string, port int) (net.Conn, error) {
-	return net.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
-}
-EOF
-
-cat > outbound/socks5.go << 'EOF'
-package outbound
-
-import (
-	"fmt"
-	"net"
-)
-
-type Socks5 struct {
-	Host, Username, Password string
-	Port                     int
-}
-
-func (s *Socks5) Connect(targetHost string, targetPort int) (net.Conn, error) {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", s.Host, s.Port))
-	if err != nil {
-		return nil, err
-	}
-	// 简化但可用的 SOCKS5 实现
-	return conn, nil
-}
-EOF
-
-cat > outbound/http.go << 'EOF'
-package outbound
-
-import (
-	"fmt"
-	"net"
-)
-
-type HTTP struct {
-	Host, Username, Password string
-	Port                     int
-}
-
-func (h *HTTP) Connect(targetHost string, targetPort int) (net.Conn, error) {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", h.Host, h.Port))
-	if err != nil {
-		return nil, err
-	}
-	return conn, nil
-}
-EOF
-
-cat > outbound/https.go << 'EOF'
-package outbound
-
-import (
-	"crypto/tls"
-	"fmt"
-	"net"
-)
-
-type HTTPS struct {
-	Host, Username, Password string
-	Port                     int
-}
-
-func (h *HTTPS) Connect(targetHost string, targetPort int) (net.Conn, error) {
-	conn, err := tls.Dial("tcp", fmt.Sprintf("%s:%d", h.Host, h.Port), &tls.Config{InsecureSkipVerify: true})
-	if err != nil {
-		return nil, err
-	}
-	return conn, nil
-}
-EOF
-
-# ==================== main.go（完整核心） ====================
-cat > main.go << 'EOF'
+    cat << 'EOF' > main.go
 package main
 
 import (
+	"bufio"
+	"context"
 	"crypto/tls"
+	"encoding/binary"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"os"
+	"net/url"
+	"strconv"
+	"strings"
 
 	"github.com/gorilla/websocket"
-	"vless-transit/outbound"
-	"vless-transit/parser"
+	"golang.org/x/net/proxy"
 )
 
-var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+var (
+	portFlag = flag.String("port", "8080", "Listen port")
+	uuidFlag = flag.String("uuid", "1f9d104e-ca0e-4202-ba4b-a0afb969c747", "VLESS UUID")
+)
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+type VlessHeader struct {
+	Version  byte
+	Command  byte // 1: TCP, 2: UDP
+	Port     uint16
+	AddrType byte // 1: IPv4, 2: Domain, 3: IPv6
+	Address  string
+	Payload  []byte
+}
 
 func main() {
-	port := getEnv("PORT", "443")
-	uuid := getEnv("UUID", "1f9d104e-ca0e-4202-ba4b-a0afb969c747")
+	flag.Parse()
+	uuidBytes := uuidToBytes(*uuidFlag)
 
-	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
-	if err != nil {
-		log.Fatal("请先生成证书")
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.ToLower(r.Header.Get("Upgrade")) != "websocket" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("<h1>VLESS Relay Service is Running</h1>"))
+			return
+		}
+
+		wsConn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("WebSocket upgrade error: %v", err)
+			return
+		}
+		defer wsConn.Close()
+
+		dialer, err := selectOutboundDialer(r.URL)
+		if err != nil {
+			log.Printf("Select outbound dialer error: %v", err)
+			return
+		}
+
+		handleVlessSession(wsConn, uuidBytes, dialer)
+	})
+
+	log.Printf("VLESS 中转服务正在启动，监听端口: :%s，设定 UUID: %s", *portFlag, *uuidFlag)
+	if err := http.ListenAndServe(":"+*portFlag, nil); err != nil {
+		log.Fatal(err)
 	}
-
-	server := &http.Server{
-		Addr: ":" + port,
-		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Upgrade") != "websocket" {
-				w.Write([]byte("VLESS WS Transit Running"))
-				return
-			}
-			ws, err := upgrader.Upgrade(w, r, nil)
-			if err != nil {
-				return
-			}
-			defer ws.Close()
-
-			ups := parser.ParsePath(r.URL.Path, r.URL.RawQuery)
-			handleVLESS(ws, uuid, ups)
-		}),
-	}
-
-	fmt.Println("VLESS WS Transit 已启动，端口:", port)
-	log.Fatal(server.ListenAndServeTLS("", ""))
 }
 
-func getEnv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+func selectOutboundDialer(u *url.URL) (proxy.Dialer, error) {
+	path := strings.Trim(u.Path, "/")
+	parts := strings.Split(path, "/")
+
+	if len(parts) >= 2 {
+		scheme := strings.ToLower(parts[0])
+		targetProxy := normalizeDashPort(parts[1])
+
+		switch scheme {
+		case "socks5", "s5":
+			return proxy.SOCKS5("tcp", targetProxy, nil, proxy.Direct)
+		case "http", "https":
+			return &HTTPConnectDialer{ProxyAddr: targetProxy, Secure: scheme == "https"}, nil
+		}
 	}
-	return def
+
+	if s5Query := u.Query().Get("socks5"); s5Query != "" {
+		parsedProxy, err := url.Parse(s5Query)
+		if err == nil {
+			var auth *proxy.Auth
+			if parsedProxy.User != nil {
+				auth = &proxy.Auth{
+					User:     parsedProxy.User.Username(),
+					Password: "",
+				}
+				if p, ok := parsedProxy.User.Password(); ok {
+					auth.Password = p
+				}
+			}
+			return proxy.SOCKS5("tcp", parsedProxy.Host, auth, proxy.Direct)
+		}
+	}
+
+	return proxy.Direct, nil
 }
 
-func handleVLESS(ws *websocket.Conn, uuid string, ups []parser.Upstream) {
-	// 简化但可工作的 VLESS 处理 + 动态出站
-	// 这里先做基础转发，完整 header 解析后续可扩展
-	targetHost := "example.com"
-	targetPort := 443
-
-	var ob outbound.Outbound
-	for _, u := range ups {
-		switch u.Type {
-		case "direct":
-			ob = &outbound.Direct{}
-		case "socks5":
-			ob = &outbound.Socks5{Host: u.Host, Port: u.Port, Username: u.Username, Password: u.Password}
-		case "http":
-			ob = &outbound.HTTP{Host: u.Host, Port: u.Port, Username: u.Username, Password: u.Password}
-		case "https":
-			ob = &outbound.HTTPS{Host: u.Host, Port: u.Port, Username: u.Username, Password: u.Password}
-		case "proxy":
-			ob = &outbound.Direct{} // proxyip 模式暂用 direct
-			targetHost = u.Host
-			targetPort = u.Port
-		}
-		if ob != nil {
-			break
-		}
-	}
-	if ob == nil {
-		ob = &outbound.Direct{}
-	}
-
-	conn, err := ob.Connect(targetHost, targetPort)
+func handleVlessSession(ws *websocket.Conn, uuidBytes []byte, dialer proxy.Dialer) {
+	_, firstMsg, err := ws.ReadMessage()
 	if err != nil {
-		log.Println("出站连接失败:", err)
 		return
 	}
-	defer conn.Close()
 
-	// 双向转发
-	go io.Copy(conn, ws.UnderlyingConn())
-	io.Copy(ws.UnderlyingConn(), conn)
+	header, err := parseVlessHeader(firstMsg, uuidBytes)
+	if err != nil {
+		log.Printf("VLESS header parse error: %v", err)
+		return
+	}
+
+	if header.Command != 1 {
+		log.Println("Unsupported command: only TCP relay is implemented in this build")
+		return
+	}
+
+	targetAddr := net.JoinHostPort(header.Address, strconv.Itoa(int(header.Port)))
+	remoteConn, err := dialer.Dial("tcp", targetAddr)
+	if err != nil {
+		log.Printf("Dial target %s failed: %v", targetAddr, err)
+		return
+	}
+	defer remoteConn.Close()
+
+	respHeader := []byte{header.Version, 0}
+	wsWriter, err := ws.NextWriter(websocket.BinaryMessage)
+	if err != nil {
+		return
+	}
+	wsWriter.Write(respHeader)
+	wsWriter.Close()
+
+	if len(header.Payload) > 0 {
+		if _, err := remoteConn.Write(header.Payload); err != nil {
+			return
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Remote -> WebSocket
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := remoteConn.Read(buf)
+			if n > 0 {
+				errW := ws.WriteMessage(websocket.BinaryMessage, buf[:n])
+				if errW != nil {
+					cancel()
+					return
+				}
+			}
+			if err != nil {
+				cancel()
+				return
+			}
+		}
+	}()
+
+	// WebSocket -> Remote
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				_, msg, err := ws.ReadMessage()
+				if err != nil {
+					cancel()
+					return
+				}
+				_, errW := remoteConn.Write(msg)
+				if errW != nil {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	<-ctx.Done()
+}
+
+func parseVlessHeader(data []byte, uuidBytes []byte) (*VlessHeader, error) {
+	if len(data) < 24 {
+		return nil, errors.New("data packet is too short")
+	}
+	version := data[0]
+	for i := 0; i < 16; i++ {
+		if data[1+i] != uuidBytes[i] {
+			return nil, errors.New("UUID verification failed")
+		}
+	}
+	optLen := int(data[17])
+	pos := 18 + optLen
+	if pos+4 > len(data) {
+		return nil, errors.New("incomplete header layout")
+	}
+	command := data[pos]
+	pos++
+	port := binary.BigEndian.Uint16(data[pos : pos+2])
+	pos += 2
+	addrType := data[pos]
+	pos++
+
+	var address string
+	switch addrType {
+	case 1:
+		if pos+4 > len(data) {
+			return nil, errors.New("invalid IPv4 address length")
+		}
+		address = net.IP(data[pos : pos+4]).String()
+		pos += 4
+	case 2:
+		if pos+1 > len(data) {
+			return nil, errors.New("invalid domain length indicator")
+		}
+		domainLen := int(data[pos])
+		pos++
+		if pos+domainLen > len(data) {
+			return nil, errors.New("domain buffer overflow")
+		}
+		address = string(data[pos : pos+domainLen])
+		pos += domainLen
+	case 3:
+		if pos+16 > len(data) {
+			return nil, errors.New("invalid IPv6 address length")
+		}
+		address = net.IP(data[pos : pos+16]).String()
+		pos += 16
+	default:
+		return nil, fmt.Errorf("unknown address type: %d", addrType)
+	}
+
+	return &VlessHeader{
+		Version:  version,
+		Command:  command,
+		Port:     port,
+		AddrType: addrType,
+		Address:  address,
+		Payload:  data[pos:],
+	}, nil
+}
+
+type HTTPConnectDialer struct {
+	ProxyAddr string
+	Secure    bool
+}
+
+func (d *HTTPConnectDialer) Dial(network, address string) (net.Conn, error) {
+	var conn net.Conn
+	var err error
+	if d.Secure {
+		conn, err = tls.Dial("tcp", d.ProxyAddr, &tls.Config{InsecureSkipVerify: true})
+	} else {
+		conn, err = net.Dial("tcp", d.ProxyAddr)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n", address, address)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		conn.Close()
+		return nil, fmt.Errorf("HTTP CONNECT tunnel failed with status: %s", resp.Status)
+	}
+
+	if br.Buffered() > 0 {
+		return &BufferedConn{Conn: conn, Reader: br}, nil
+	}
+	return conn, nil
+}
+
+type BufferedConn struct {
+	net.Conn
+	Reader *bufio.Reader
+}
+
+func (c *BufferedConn) Read(b []byte) (int, error) { return c.Reader.Read(b) }
+
+func uuidToBytes(uuid string) []byte {
+	hexStr := strings.ReplaceAll(uuid, "-", "")
+	if len(hexStr) != 32 {
+		return make([]byte, 16)
+	}
+	out := make([]byte, 16)
+	for i := 0; i < 16; i++ {
+		val, err := strconv.ParseUint(hexStr[i*2:i*2+2], 16, 8)
+		if err != nil {
+			return make([]byte, 16)
+		}
+		out[i] = byte(val)
+	}
+	return out
+}
+
+func normalizeDashPort(val string) string {
+	if !strings.Contains(val, ":") {
+		idx := strings.LastIndex(val, "-")
+		if idx > 0 {
+			return val[:idx] + ":" + val[idx+1:]
+		}
+	}
+	return val
 }
 EOF
 
-# 生成自签名证书
-openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 3650 -nodes -subj "/CN=VLESS-Transit"
+    echo -e "${YELLOW}正在编译并打包程序...${PLAIN}"
+    export PATH=$PATH:/usr/local/go/bin
+    go mod init vless-relay 2>/dev/null
+    go get github.com/gorilla/websocket
+    go get golang.org/x/net/proxy
+    go mod tidy
+    go build -ldflags="-s -w" -o vless-relay main.go
 
-# 编译
-go mod tidy
-go build -o vless-transit .
+    if [ ! -f "vless-relay" ]; then
+        echo -e "${RED}编译失败，请检查编译日志。${PLAIN}"
+        exit 1
+    fi
 
-# systemd 服务
-cat > /etc/systemd/system/vless-transit.service << 'EOF'
+    mv vless-relay /usr/local/bin/vless-relay
+    chmod +x /usr/local/bin/vless-relay
+    cd / && rm -rf "$BUILD_DIR"
+    echo -e "${GREEN}中转服务端编译并安装成功。${PLAIN}"
+}
+
+# 部署并配置 Systemd 守护进程
+configure_systemd() {
+    echo -e "${YELLOW}配置守护进程自启...${PLAIN}"
+
+    # 生成默认配置
+    read -p "请输入您希望中转监听的端口 (默认 8080): " LIST_PORT
+    [ -z "$LIST_PORT" ] && LIST_PORT="8080"
+
+    read -p "请输入您的 VLESS UUID (留空将自动生成一个 UUID): " INPUT_UUID
+    if [ -z "$INPUT_UUID" ]; then
+        if command -v uuidgen >/dev/null 2>&1; then
+            INPUT_UUID=$(uuidgen)
+        elif [ -f /proc/sys/kernel/random/uuid ]; then
+            INPUT_UUID=$(cat /proc/sys/kernel/random/uuid)
+        else
+            INPUT_UUID="1f9d104e-ca0e-4202-ba4b-a0afb969c747"
+        fi
+    fi
+
+    # 写入 systemd 服务
+    cat << EOF > /etc/systemd/system/vless-relay.service
 [Unit]
-Description=VLESS WS Transit Server (Full Version)
+Description=VLESS Relay Service
 After=network.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/vless-transit
-ExecStart=/opt/vless-transit/vless-transit
-Environment=UUID=1f9d104e-ca0e-4202-ba4b-a0afb969c747
-Environment=PORT=443
-Restart=always
+WorkingDirectory=/usr/local/bin
+ExecStart=/usr/local/bin/vless-relay -port=${LIST_PORT} -uuid=${INPUT_UUID}
+Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
 
@@ -340,14 +479,97 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable vless-transit
-systemctl restart vless-transit
+    systemctl daemon-reload
+    systemctl enable vless-relay.service
+    systemctl restart vless-relay.service
 
-echo ""
-echo "✅ 部署完成！"
-echo "状态查看: systemctl status vless-transit"
-echo "日志查看: journalctl -u vless-transit -f"
-echo ""
-echo "当前已支持路径传参（/socks5/ /https/ /http/ /proxyip 等）"
-echo "如需更新代码，修改 main.go 后执行: systemctl restart vless-transit"
+    echo -e "${GREEN}守护进程配置成功，并已拉起服务运行。${PLAIN}"
+    echo -e "${YELLOW}当前配置信息：${PLAIN}"
+    echo -e "  监听端口: ${GREEN}${LIST_PORT}${PLAIN}"
+    echo -e "  VLESS UUID: ${GREEN}${INPUT_UUID}${PLAIN}"
+}
+
+# 自动安装 Cloudflare Tunnel 客户端
+install_cloudflared() {
+    echo -e "${YELLOW}是否安装 Cloudflare Tunnel 客户端 (用于联动 Argo 进行内网穿透与优化防封)? (y/n)${PLAIN}"
+    read -p "请输入选择 (默认 n): " CHOICE
+    if [[ "$CHOICE" == "y" || "$CHOICE" == "Y" ]]; then
+        echo -e "${YELLOW}正在安装 cloudflared...${PLAIN}"
+        wget -q -O /tmp/cloudflared.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}.deb"
+        if [ -f /tmp/cloudflared.deb ]; then
+            dpkg -i /tmp/cloudflared.deb 2>/dev/null || apt-get install -f -y
+            rm -f /tmp/cloudflared.deb
+        else
+            # CentOS / RHEL 回退到下载二进制
+            wget -q -O /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+            chmod +x /usr/local/bin/cloudflared
+        fi
+        echo -e "${GREEN}cloudflared 客户端安装成功。${PLAIN}"
+        echo -e "${YELLOW}您可以随时运行以下命令来绑定并启动 Argo 隧道：${PLAIN}"
+        echo -e "  1. 执行 ${GREEN}sudo cloudflared tunnel login${PLAIN} 绑定您的账户。"
+        echo -e "  2. 执行 ${GREEN}sudo cloudflared tunnel create <您的隧道名字>${PLAIN} 创建隧道。"
+    fi
+}
+
+# 卸载功能
+uninstall_service() {
+    echo -e "${RED}警告：您正在执行卸载操作，该操作将完全清除程序和守护进程。${PLAIN}"
+    read -p "确定要卸载吗? (y/n, 默认 n): " UN_CHOICE
+    if [[ "$UN_CHOICE" == "y" || "$UN_CHOICE" == "Y" ]]; then
+        systemctl stop vless-relay.service 2>/dev/null
+        systemctl disable vless-relay.service 2>/dev/null
+        rm -f /etc/systemd/system/vless-relay.service
+        systemctl daemon-reload
+        rm -f /usr/local/bin/vless-relay
+        echo -e "${GREEN}卸载完成。${PLAIN}"
+    else
+        echo -e "${YELLOW}已取消卸载。${PLAIN}"
+    fi
+}
+
+# 主菜单
+show_menu() {
+    clear
+    echo -e "==========================================="
+    echo -e "      VLESS 动态出站中转一键部署脚本         "
+    echo -e "==========================================="
+    echo -e "  1. 完整编译安装 (Go构建 + 进程守护)"
+    echo -e "  2. 重启 VLESS 中转服务"
+    echo -e "  3. 停止 VLESS 中转服务"
+    echo -e "  4. 查看中转服务运行日志"
+    echo -e "  5. 卸载中转服务"
+    echo -e "  0. 退出脚本"
+    echo -e "==========================================="
+    read -p "请输入选项: " MENU_ID
+    case "$MENU_ID" in
+        1)
+            install_base_deps
+            install_go
+            build_vless_relay
+            configure_systemd
+            install_cloudflared
+            ;;
+        2)
+            systemctl restart vless-relay.service
+            echo -e "${GREEN}服务已重启。${PLAIN}"
+            ;;
+        3)
+            systemctl stop vless-relay.service
+            echo -e "${YELLOW}服务已停止。${PLAIN}"
+            ;;
+        4)
+            journalctl -u vless-relay.service -n 50 -f
+            ;;
+        5)
+            uninstall_service
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}请输入正确的选项!${PLAIN}"
+            ;;
+    esac
+}
+
+show_menu
